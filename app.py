@@ -1,467 +1,882 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from source import *
 
-# --- Page Configuration ---
-st.set_page_config(page_title="QuLab: Lab 46: Ethical Checklist Application", layout="wide")
-st.sidebar.image("https://www.quantuniversity.com/assets/img/logo5.jpg")
-st.sidebar.divider()
-st.title("QuLab: Lab 46: Ethical Checklist Application")
-st.divider()
+# Import domain logic + canonical policy content
+from source import (
+    ETHICAL_CHECKLIST,
+    OVERSIGHT_POLICY,
+    REGULATORY_MAP,
+    tier_model,
+    apply_ethical_checklist,
+    get_model_tiers_dataframe,
+)
 
-# --- Core Application State ---
-if 'current_page' not in st.session_state:
-    st.session_state.current_page = 'Home'
+# -----------------------------------------------------------------------------
+# Page configuration
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="QuLab: Lab 46: Ethical Checklist Application",
+    layout="wide",
+)
 
-# --- Static Data from source.py (loaded once) ---
-if 'course_models_data' not in st.session_state:
-    st.session_state.course_models_data = course_models
-if 'tier_df_data' not in st.session_state:
-    st.session_state.tier_df_data = tier_df
-if 'ethical_checklist_questions' not in st.session_state:
-    st.session_state.ethical_checklist_questions = ETHICAL_CHECKLIST
-if 'oversight_policy_data' not in st.session_state:
-    st.session_state.oversight_policy_data = OVERSIGHT_POLICY
-if 'regulatory_map_data' not in st.session_state:
-    st.session_state.regulatory_map_data = REGULATORY_MAP
-if 'governance_policy_document_content' not in st.session_state:
-    st.session_state.governance_policy_document_content = compile_governance_policy()
+# -----------------------------------------------------------------------------
+# Data: synthetic but finance-native models used throughout the learning flow
+# (Kept explicit so users can audit assumptions and reproduce all numbers.)
+# -----------------------------------------------------------------------------
+COURSE_MODELS_PARAMS = [
+    {'model_name': 'Credit Default XGBoost', 'decision_impact': 'automated_decision', 'autonomy_level': 'human_approves',
+        'regulatory_exposure': 'high_risk_regulated', 'client_facing': True, 'financial_impact_usd': 50_000_000},
+    {'model_name': 'Trading RL Agent', 'decision_impact': 'autonomous_action', 'autonomy_level': 'human_monitors',
+        'regulatory_exposure': 'sector_specific', 'client_facing': False, 'financial_impact_usd': 100_000_000},
+    {'model_name': 'News Sentiment (FinBERT)', 'decision_impact': 'informational', 'autonomy_level': 'human_executes',
+     'regulatory_exposure': 'none', 'client_facing': False, 'financial_impact_usd': 0},
+    {'model_name': 'Research Copilot (RAG)', 'decision_impact': 'advisory', 'autonomy_level': 'human_executes',
+     'regulatory_exposure': 'general', 'client_facing': True, 'financial_impact_usd': 0},
+    {'model_name': 'Portfolio Rebalancing Agent', 'decision_impact': 'recommendation', 'autonomy_level': 'human_approves',
+        'regulatory_exposure': 'sector_specific', 'client_facing': False, 'financial_impact_usd': 50_000_000},
+    {'model_name': 'ESG Research Agent', 'decision_impact': 'advisory', 'autonomy_level': 'human_executes',
+        'regulatory_exposure': 'general', 'client_facing': False, 'financial_impact_usd': 0},
+]
 
-# --- Interactive User Input & Results State ---
-if 'selected_checklist_model_name' not in st.session_state:
-    st.session_state.selected_checklist_model_name = st.session_state.course_models_data[0]['model'] if st.session_state.course_models_data else None
+# -----------------------------------------------------------------------------
+# Utility: traceable tier score decomposition (no hidden arithmetic)
+# -----------------------------------------------------------------------------
+_DECISION_IMPACT_POINTS = {
+    "informational": 1,
+    "advisory": 2,
+    "recommendation": 3,
+    "automated_decision": 4,
+    "autonomous_action": 5,
+}
 
-if 'user_checklist_answers' not in st.session_state:
-    st.session_state.user_checklist_answers = {model['model']: {} for model in st.session_state.course_models_data}
-    # Pre-populate examples
-    if 'Credit Default XGBoost' in st.session_state.user_checklist_answers:
-        st.session_state.user_checklist_answers['Credit Default XGBoost'] = {
-            1: 'yes', 2: 'yes', 3: 'yes', 4: 'yes', 5: 'yes',
-            6: 'partial', 7: 'yes', 8: 'partial', 9: 'yes', 10: 'yes'
-        }
-    if 'Trading RL Agent' in st.session_state.user_checklist_answers:
-        st.session_state.user_checklist_answers['Trading RL Agent'] = {
-            1: 'yes', 2: 'no', 3: 'no', 4: 'partial', 5: 'partial',
-            6: 'no', 7: 'yes', 8: 'no', 9: 'no', 10: 'partial'
-        }
+_AUTONOMY_POINTS = {
+    "human_executes": 1,
+    "human_approves": 2,
+    "human_monitors": 3,
+    "human_reviews_after": 4,
+    "fully_autonomous": 5,
+}
 
-if 'ethical_evaluation_results' not in st.session_state:
+_REGULATORY_POINTS = {
+    "none": 0,
+    "general": 1,
+    "sector_specific": 2,
+    "high_risk_regulated": 3,
+}
+
+
+def compute_tier_breakdown(model: dict) -> dict:
+    """Return score components used in S so a user can audit every point."""
+    s_impact = _DECISION_IMPACT_POINTS[model["decision_impact"]]
+    s_autonomy = _AUTONOMY_POINTS[model["autonomy_level"]]
+    s_reg = _REGULATORY_POINTS[model["regulatory_exposure"]]
+    s_client = 2 if model["client_facing"] else 0
+
+    fin = float(model["financial_impact_usd"])
+    if fin > 10_000_000:
+        s_fin = 3
+    elif fin > 1_000_000:
+        s_fin = 2
+    elif fin > 100_000:
+        s_fin = 1
+    else:
+        s_fin = 0
+
+    total = s_impact + s_autonomy + s_reg + s_client + s_fin
+    return {
+        "Model": model["model_name"],
+        "S_impact": s_impact,
+        "S_autonomy": s_autonomy,
+        "S_regulatory": s_reg,
+        "S_client_facing": s_client,
+        "S_financial_impact": s_fin,
+        "S_total": total,
+    }
+
+
+def assumptions_box(lines: list[str], title: str = "Assumptions & Traceability") -> None:
+    with st.expander(title, expanded=False):
+        st.markdown("\n".join([f"- {line}" for line in lines]))
+
+
+def evidence_box(lines: list[str], title: str = "Evidence you should expect to have on hand") -> None:
+    st.info("\n".join([f"- {line}" for line in lines]))
+
+
+# -----------------------------------------------------------------------------
+# Session state init
+# -----------------------------------------------------------------------------
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "Home"
+
+if "tier_df" not in st.session_state:
+    st.session_state.tier_df = get_model_tiers_dataframe(COURSE_MODELS_PARAMS)
+
+if "tier_breakdown_df" not in st.session_state:
+    st.session_state.tier_breakdown_df = pd.DataFrame(
+        [compute_tier_breakdown(m) for m in COURSE_MODELS_PARAMS]
+    ).set_index("Model")
+
+if "ethical_evaluation_results" not in st.session_state:
+    # Store per-model evaluation outputs (so the final report is a committee packet)
     st.session_state.ethical_evaluation_results = {}
 
-# --- Helper Function for Display ---
-def calculate_pillar_scores_for_display(model_name, user_answers_for_model, ethical_checklist_data):
-    pillar_score_data = {
-        'Fairness': {'score': 0, 'max_score': 0},
-        'Accountability': {'score': 0, 'max_score': 0},
-        'Transparency': {'score': 0, 'max_score': 0},
-        'Privacy': {'score': 0, 'max_score': 0},
-        'Security': {'score': 0, 'max_score': 0},
-        'Reliability': {'score': 0, 'max_score': 0}
-    }
-    
-    for q_item in ethical_checklist_data:
-        q_id = q_item['id']
-        pillar = q_item['pillar']
-        weight = q_item['weight']
-        answer = user_answers_for_model.get(q_id, 'no')
-        
-        points = weight if answer == 'yes' else weight * 0.5 if answer == 'partial' else 0
-        
-        if pillar in pillar_score_data:
-            pillar_score_data[pillar]['score'] += points
-            pillar_score_data[pillar]['max_score'] += weight
-    
-    final_pillar_scores_pct = {}
-    for pillar, scores in pillar_score_data.items():
-        if scores['max_score'] > 0:
-            final_pillar_scores_pct[pillar] = (scores['score'] / scores['max_score']) * 100
-        else:
-            final_pillar_scores_pct[pillar] = 0
-            
-    return final_pillar_scores_pct
-
-# Pre-run ethical checklist for the example models
-for model_name_iter, answers_iter in st.session_state.user_checklist_answers.items():
-    if answers_iter and model_name_iter not in st.session_state.ethical_evaluation_results:
-        result_iter = apply_checklist(model_name_iter, answers_iter)
-        pillar_scores_iter = calculate_pillar_scores_for_display(model_name_iter, answers_iter, st.session_state.ethical_checklist_questions)
-        st.session_state.ethical_evaluation_results[model_name_iter] = {
-            'score': result_iter['score'],
-            'grade': result_iter['grade'],
-            'gaps': result_iter['gaps'],
-            'pillar_scores': pillar_scores_iter
-        }
-
-# --- Sidebar Navigation ---
+# -----------------------------------------------------------------------------
+# Sidebar: workflow navigation + progress cues
+# -----------------------------------------------------------------------------
+st.sidebar.image("https://www.quantuniversity.com/assets/img/logo5.jpg")
+st.sidebar.divider()
 st.sidebar.title("QuantAlpha AI Governance")
+
+PAGES = [
+    "Home",
+    "1. Framework Overview",
+    "2. Model Risk Tiering",
+    "3. Ethical Checklist",
+    "4. Human Oversight Policy",
+    "5. Regulatory Mapping",
+    "6. Governance Policy Document",
+    "7. Final Report",
+]
+
 page_selection = st.sidebar.selectbox(
-    "Navigate QuantAlpha AI Governance",
-    [
-        "Home",
-        "1. Framework Overview",
-        "2. Model Risk Tiering",
-        "3. Ethical Checklist",
-        "4. Human Oversight Policy",
-        "5. Regulatory Mapping",
-        "6. Governance Policy Document",
-        "7. Final Report"
-    ]
+    "Navigate the governance workflow",
+    PAGES,
+    index=PAGES.index(
+        st.session_state.current_page) if st.session_state.current_page in PAGES else 0
 )
 st.session_state.current_page = page_selection
 
-# --- Main Content ---
 
+st.sidebar.divider()
+st.sidebar.caption(
+    "All numeric outputs in this app are computed from documented rules. No hidden scoring.")
+
+# -----------------------------------------------------------------------------
+# Main header
+# -----------------------------------------------------------------------------
+st.title("QuLab: Lab 46: Ethical Checklist Application")
+st.divider()
+
+# =============================================================================
+# Page: Home
+# =============================================================================
 if st.session_state.current_page == "Home":
-    st.title("Introduction: Ensuring Responsible AI at QuantAlpha Investments")
+    st.header(
+        "Introduction: Ethical Governance as a Decision Workflow (Not a Vibe Check)")
 
-    st.markdown(f"""
-    Welcome, **CFA Charterholders and Investment Professionals**!
-    As AI models become increasingly integral to financial decision-making, ensuring their ethical operation, transparency, and accountability is paramount. At **QuantAlpha Investments**, we are committed to upholding the highest standards of responsible AI.
+    st.markdown(
+        """
+In this lab, you will play the role of **Alex Chen (Governance & Risk Officer)** at QuantAlpha, a financial services firm deploying AI models.
+Your objective is to produce a **defensible, audit-ready recommendation** for whether a model is:
+- **Deployable now**
+- **Deployable with controls**
+- **Blocked pending remediation**
 
-    Meet Alex Chen, a Senior Risk Analyst at QuantAlpha. His role involves evaluating AI models to identify potential risks, ensure compliance with internal policies and external regulations, and ultimately build client trust. Today, Alex is tasked with applying QuantAlpha's newly adopted AI Governance Framework to several critical models used across the firm, from credit assessment to algorithmic trading. This exercise will help him systematically assess model risks, ethical considerations, and compliance readiness, culminating in a comprehensive AI governance policy document.
+This app is designed for investment professionals: the goal is *decision usefulness* and *traceability*.
+        """
+    )
 
-    This application will guide you through Alex's workflow, demonstrating how to:
-    *   Implement a five-pillar AI governance framework.
-    *   Build a model risk tiering system to classify models by risk factors.
-    *   Apply a 10-question ethical checklist to score AI models and identify governance gaps.
-    *   Define human oversight policies for AI-driven decisions.
-    *   Map regulatory compliance, linking controls to requirements.
-    *   Generate a formal AI governance policy document.
+    st.success(
+        "Traceability pledge: every number you see is computable from explicit, documented rules "
+        "(tier score components; checklist weights; grade thresholds)."
+    )
 
-    Let's begin by navigating through the sections in the sidebar.
-    """)
+    st.markdown("### What you will do in this workflow")
+    st.markdown(
+        """
+1. Understand the governance framework (principles + operating pillars).
+2. Tier each model by risk (so governance effort scales with impact).
+3. Apply a weighted ethical checklist (controls & evidence).
+4. Choose an appropriate human oversight level (who can stop/override the model).
+5. Map requirements to controls (audit trail).
+6. Generate a governance policy artifact (what a committee can sign).
+7. Produce a final recommendation packet.
+        """
+    )
 
+    st.markdown("### Micro-case anchor (finance-native)")
+    st.markdown(
+        "A **credit decision model** is closer to a capital allocation decision than a research dashboard: "
+        "errors are asymmetric, regulated, and reputationally contagious—so the control bar is higher."
+    )
+
+    assumptions_box(
+        [
+            "This lab uses synthetic model metadata (impact, autonomy, regulatory exposure, client-facing, financial impact).",
+            "Tier score is additive and transparently decomposed later.",
+            "Checklist scoring is weighted and the rubric (Yes/Partial/No → points) is explicit.",
+        ],
+        title="Assumptions & what 'no black box' means here",
+    )
+
+# =============================================================================
+# Page: 1. Framework Overview
+# =============================================================================
 elif st.session_state.current_page == "1. Framework Overview":
-    st.header("1. Understanding the Foundation: The Five-Pillar AI Governance Framework")
-    st.markdown(f"""
-    Before diving into specific model evaluations, Alex reviews QuantAlpha's overarching AI governance framework. This framework, inspired by leading financial industry standards, provides the structural foundation for managing AI risks. It outlines the core principles, organizational responsibilities, lifecycle controls, monitoring processes, and regulatory mappings essential for responsible AI deployment. For Alex, understanding these pillars helps him contextualize every subsequent task, ensuring his evaluations align with QuantAlpha's strategic commitment to ethical AI.
+    st.header("Framework Map: Principles (FATPSR) + Operating Pillars")
 
-    The five pillars are:
-    1.  **Principles:** Core ethical commitments like Fairness, Accountability, Transparency, Privacy, Security, and Reliability (FATPSR). These guide all AI initiatives.
-    2.  **Organization:** Defines roles, responsibilities (e.g., AI Governance Committee, Model Risk Management), and clear escalation paths.
-    3.  **Lifecycle Controls:** Checkpoints at each phase of a model's lifecycle, from data acquisition to development, validation, deployment, monitoring, and retirement.
-    4.  **Monitoring & Incident Response:** Continuous surveillance of models in production, defining alert thresholds, and a protocol for detecting, containing, investigating, remediating, and preventing AI incidents.
-    5.  **Regulatory Compliance:** Mapping AI use cases to applicable financial regulations (e.g., SR 11-7, EU AI Act, ECOA, FINRA, GDPR) and tracking evolving requirements.
+    st.markdown(
+        """
+QuantAlpha uses a governance framework that combines:
 
-    These pillars are not theoretical; they form the operational backbone of how QuantAlpha manages AI risk.
-    """)
-    st.subheader("Five-Pillar AI Governance Framework Diagram (Conceptual)")
-    st.info("Imagine a diagram with 'Principles' at the core, surrounded by 'Organization', 'Lifecycle Controls', 'Monitoring & Incident Response', and 'Regulatory Compliance' as interconnected pillars supporting responsible AI deployment.")
+**A) Principles (FATPSR):** what “good” must mean in high-stakes finance contexts  
+- **Fairness, Accountability, Transparency, Privacy, Security, Reliability**
 
+**B) Operating pillars:** how the organization enforces those principles in practice  
+- Ownership & roles  
+- Lifecycle gates (development → validation → deployment → monitoring)  
+- Monitoring & incident response  
+- Regulatory mapping & auditability
+        """
+    )
+
+    st.markdown("### Why this matters (decision relevance)")
+    st.info(
+        "In finance, governance is not optional documentation. It is a control system that allocates validation "
+        "budget, defines escalation paths, and creates audit-ready evidence."
+    )
+
+    st.markdown("### Quick checkpoint (to build intuition)")
+    q = st.radio(
+        "If a model is accurate but has no documented bias testing for a regulated use case, what is the governance implication?",
+        [
+            "It is deployable because performance dominates.",
+            "It may be blocked because controls/evidence are missing, regardless of performance.",
+            "It only needs more monitoring after deployment.",
+        ],
+        index=None,
+        key="quiz_framework_q1",
+    )
+    if q:
+        if q.startswith("It may be blocked"):
+            st.success(
+                "Correct. Governance treats missing controls (evidence) as a deployment blocker in regulated contexts.")
+        else:
+            st.warning(
+                "Watch-out: performance does not substitute for control coverage. "
+                "In regulated contexts, missing bias testing / explainability evidence is often a hard stop."
+            )
+
+# =============================================================================
+# Page: 2. Model Risk Tiering
+# =============================================================================
 elif st.session_state.current_page == "2. Model Risk Tiering":
-    st.header("2. Quantifying Model Risk with a Tiering System")
-    st.markdown(f"""
-    Alex knows that not all AI models pose the same level of risk. A trading model handling millions in client assets requires more stringent oversight than an internal sentiment analysis tool. To allocate QuantAlpha's governance resources effectively, he uses a **Model Risk Tiering System**. This system assigns a risk tier (High, Medium, or Low) based on several factors, including the model's decision impact, autonomy, regulatory exposure, whether it's client-facing, and its potential financial impact. The higher the risk tier, the more rigorous the governance requirements.
-    """)
+    st.header("Model Risk Tiering: Allocate Governance Effort by Materiality")
 
+    st.markdown(
+        """
+Tiering is a **resource allocation mechanism**: high-impact + high-autonomy + regulated + client-facing + high USD impact
+should trigger heavier validation and stronger oversight.
+
+You will see two views:
+1) **Tier results** (score, tier, required governance)
+2) **Score decomposition** (component-by-component so the numbers are auditable)
+        """
+    )
+
+    # --- KEEP FORMULAE (unchanged) ---
     st.markdown(r"The scoring mechanism for model risk is based on an additive score $S$, which aggregates points from various attributes:")
-    st.markdown(r"$$ S = S_{\text{impact}} + S_{\text{autonomy}} + S_{\text{regulatory}} + S_{\text{client\_facing}} + S_{\text{financial\_impact}} $$")
-    st.markdown(r"where $S_{\text{impact}}$ is the score based on `decision_impact` (e.g., informational=1, automated_decision=4),")
-    st.markdown(r"where $S_{\text{autonomy}}$ is the score based on `autonomy_level` (e.g., human_executes=1, fully_autonomous=5),")
-    st.markdown(r"where $S_{\text{regulatory}}$ is the score based on `regulatory_exposure` (e.g., none=0, high_risk_regulated=3),")
-    st.markdown(r"where $S_{\text{client\_facing}}$ is a bonus score if `client_facing` is True, and")
-    st.markdown(r"where $S_{\text{financial\_impact}}$ is the score based on `financial_impact_usd` (e.g., >$10M = 3 points).")
+    st.markdown(
+        r"""
+$$
+S = S_{\text{impact}} + S_{\text{autonomy}} + S_{\text{regulatory}} + S_{\text{client\_facing}} + S_{\text{financial\_impact}}
+$$""")
+    st.markdown(
+        r"where $S_{\text{impact}}$ is the score based on `decision_impact` (e.g., informational=1, automated_decision=4),")
+    st.markdown(
+        r"where $S_{\text{autonomy}}$ is the score based on `autonomy_level` (e.g., human_executes=1, fully_autonomous=5),")
+    st.markdown(
+        r"where $S_{\text{regulatory}}$ is the score based on `regulatory_exposure` (e.g., none=0, high_risk_regulated=3),")
+    st.markdown(
+        r"where $S_{\text{client\_facing}}$ is a bonus score if `client_facing` is True, and")
+    st.markdown(
+        r"where $S_{\text{financial\_impact}}$ is the score based on `financial_impact_usd` (e.g., >$10M = 3 points).")
 
-    st.markdown(r"Based on the total score $S$, the model is assigned a tier:")
-    st.markdown(r"$$ \text{Tier} = \begin{cases} 1 & \text{if } S \ge 10 \\ 2 & \text{if } 6 \le S < 10 \\ 3 & \text{if } S < 6 \end{cases} $$")
-    st.markdown(f"""
-    Each tier dictates specific governance requirements, ensuring that high-risk models receive comprehensive validation and oversight, while lower-risk models have proportional controls.
-    """)
+    assumptions_box(
+        [
+            "Decision impact, autonomy, and regulatory exposure use fixed point mappings (shown in the decomposition table).",
+            "Client-facing adds +2 points (reputational + conduct risk amplification).",
+            "Financial impact points are discretized by materiality thresholds (>$10M, >$1M, >$100k).",
+            "Tier thresholds: Tier 1 if S≥10; Tier 2 if 6≤S<10; Tier 3 if S<6.",
+        ],
+        title="Assumptions behind tier scoring (explicit rules)",
+    )
 
-    st.subheader("QuantAlpha's AI Model Risk Tiers")
-    st.dataframe(st.session_state.tier_df_data[['model', 'score', 'tier', 'governance_requirements']].style.set_properties(**{'font-size': '12pt'}))
-    st.markdown(f"""
-    **Explanation of Execution**
+    st.subheader("Tier Results (committee view)")
+    st.dataframe(st.session_state.tier_df.set_index("model"))
 
-    The table above clearly shows each AI model's calculated risk score, its assigned tier, and the corresponding governance requirements. For Alex, this table is crucial:
-    *   **Credit Default XGBoost** and **Trading RL Agent** are Tier 1 (High Risk), signaling that they require Alex to perform extensive validation, bias testing, explainability analysis (XAI), and committee approval.
-    *   **Portfolio Rebalancing Agent** is Tier 2 (Medium Risk), requiring validation, monitoring, and manager approval.
-    *   Internal tools like **News Sentiment (FinBERT)**, **Research Copilot (RAG)**, and **ESG Research Agent** are Tier 3 (Low Risk), needing less intensive oversight, primarily documentation and basic testing.
+    st.caption(
+        "Interpretation: This is not predictive performance. It is governance materiality. "
+        "Tier determines minimum controls and sign-off burden."
+    )
 
-    This tiering system allows Alex and QuantAlpha to efficiently allocate their risk management resources, focusing on the models that pose the greatest potential impact. It prevents over-governing low-risk models and under-governing high-risk ones, mitigating potential liabilities.
-    """)
+    st.subheader("Score Decomposition (audit view)")
+    st.dataframe(st.session_state.tier_breakdown_df)
 
+    st.markdown("### Quick checkpoint (to build intuition)")
+    q2 = st.radio(
+        "A model is Tier 1 primarily because it is (pick the best answer):",
+        [
+            "Mathematically complex.",
+            "High impact/autonomy/regulatory/client-facing/financial materiality.",
+            "Hard to explain.",
+        ],
+        index=None,
+        key="quiz_tiering_q1",
+    )
+    if q2:
+        if q2.startswith("High impact"):
+            st.success(
+                "Correct. Tiering is about materiality and governance burden, not model complexity.")
+        else:
+            st.warning(
+                "Watch-out: complexity can matter, but tiering here is driven by impact, autonomy, regulation, and materiality.")
+
+# =============================================================================
+# Page: 3. Ethical Checklist
+# =============================================================================
 elif st.session_state.current_page == "3. Ethical Checklist":
-    st.header("3. Ethical Evaluation using a Comprehensive Checklist")
-    st.markdown(f"""
-    Having identified the risk tiers, Alex now needs to perform a deeper ethical evaluation, especially for the high-risk models. QuantAlpha utilizes a **10-question AI Ethical Checklist** aligned with the FATPSR principles. This checklist helps Alex systematically assess specific ethical considerations, identify potential gaps, and score models against QuantAlpha's responsible AI standards. It's not just a pass/fail mechanism but a diagnostic tool to pinpoint areas needing improvement before a model reaches production or for ongoing monitoring.
-    """)
+    st.header("Ethical Checklist: Score Control Coverage (Weighted, Evidence-Based)")
 
+    st.markdown(
+        """
+This section treats ethics as **controls and evidence**, not slogans.
+Each question is tagged to a governance pillar and assigned a weight reflecting materiality.
+You will score a model and receive:
+
+- **Raw points vs max points**
+- **% score and grade**
+- **Gaps list (action plan)**
+- **Pillar diagnostic (radar)**
+- **A decision recommendation with guardrails**
+        """
+    )
+
+    # --- KEEP FORMULAE (unchanged) ---
     st.markdown(r"For each question, a score is awarded based on the answer:")
     st.markdown(r"*   'yes': full weight ($W_q$)")
     st.markdown(r"*   'partial': half weight ($0.5 \times W_q$)")
     st.markdown(r"*   'no': zero weight (0)")
-
-    st.markdown(r"The total score $S$ for a model is the sum of points from all questions:")
-    st.markdown(r"$$ S = \sum_{q \in \text{Checklist}} P_q $$")
+    st.markdown(
+        r"The total score $S$ for a model is the sum of points from all questions:")
+    st.markdown(r"""
+$$
+S = \sum_{q \in \text{Checklist}} P_q
+$$""")
     st.markdown(r"where $P_q$ is the points received for question $q$.")
-    st.markdown(r"The maximum possible score $S_{\text{max}}$ is the sum of all question weights:")
-    st.markdown(r"$$ S_{\text{max}} = \sum_{q \in \text{Checklist}} W_q $$")
+    st.markdown(
+        r"The maximum possible score $S_{\text{max}}$ is the sum of all question weights:")
+    st.markdown(r"""
+$$
+S_{\text{max}} = \sum_{q \in \text{Checklist}} W_q
+$$""")
     st.markdown(r"The percentage score $\text{Pct}$ is then calculated as:")
-    st.markdown(r"$$ \text{Pct} = \frac{S}{S_{\text{max}}} \times 100 $$")
+    st.markdown(r"""
+$$
+\text{Pct} = \frac{S}{S_{\text{max}}} \times 100
+$$""")
     st.markdown(r"Finally, a grade is assigned based on the percentage score:")
-    st.markdown(r"$$ \text{Grade} = \begin{cases} \text{A} & \text{if } \text{Pct} \ge 90 \\ \text{B} & \text{if } \text{Pct} \ge 75 \\ \text{C} & \text{if } \text{Pct} \ge 60 \\ \text{F} & \text{if } \text{Pct} < 60 \end{cases} $$")
+    st.markdown(r"""
+$$
+\text{Grade} = \begin{cases} \text{A} & \text{if } \text{Pct} \ge 90 \\ \text{B} & \text{if } \text{Pct} \ge 75 \\ \text{C} & \text{if } \text{Pct} \ge 60 \\ \text{F} & \text{if } \text{Pct} < 60 \end{cases}
+$$""")
 
-    st.subheader("Apply Ethical Checklist")
-
-    model_options = [model['model'] for model in st.session_state.course_models_data]
-    
-    current_selection = st.session_state.selected_checklist_model_name
-    index_val = model_options.index(current_selection) if current_selection in model_options else 0
-
-    selected_model_name = st.selectbox(
-        "Select an AI Model for Evaluation:",
-        options=model_options,
-        index=index_val,
-        key='ethical_checklist_model_selector'
+    evidence_box(
+        [
+            "Bias test report (coverage, thresholds, results, sign-off)",
+            "Model card / validation memo (assumptions, limitations, performance, stability)",
+            "Explainability artifacts (reason codes, local explanation examples, governance sign-off)",
+            "Audit logs and access controls (who changed what, when)",
+            "Incident runbook (monitoring metrics, triggers, escalation, kill-switch)",
+        ]
     )
-    st.session_state.selected_checklist_model_name = selected_model_name
 
-    current_answers = st.session_state.user_checklist_answers.get(selected_model_name, {})
+    model_names = [m["model_name"] for m in COURSE_MODELS_PARAMS]
+    selected_model = st.selectbox(
+        "Choose the model you are evaluating for committee sign-off",
+        model_names,
+        index=model_names.index(
+            "Credit Default XGBoost") if "Credit Default XGBoost" in model_names else 0,
+    )
 
-    st.markdown("---")
-    st.subheader(f"Questions for: {selected_model_name}")
-    col1, col2 = st.columns([3, 1])
-    col1.markdown("**Question**")
-    col2.markdown("**Answer**")
-    st.markdown("---")
+    tier_row = st.session_state.tier_df[st.session_state.tier_df["model"]
+                                        == selected_model]
+    tier_value = int(tier_row["tier"].iloc[0]) if not tier_row.empty else None
 
-    answers_updated = False
-    for q_item in st.session_state.ethical_checklist_questions:
-        question_id = q_item['id']
-        question_text = q_item['question']
-        pillar = q_item['pillar']
-        
-        # Display question and capture answer using st.radio
-        ans_key = f"answer_{selected_model_name}_{question_id}"
-        default_answer = current_answers.get(question_id, 'no') # Default to 'no' if not answered yet
-        
-        new_answer = st.radio(
-            f"**Q{question_id} ({pillar}):** {question_text}",
-            options=['yes', 'partial', 'no'],
-            index=['yes', 'partial', 'no'].index(default_answer),
-            key=ans_key,
-            horizontal=True
+    st.markdown("### Step 1: Answer the controls (weights shown explicitly)")
+
+    answers = {}
+    with st.expander("Control questions (answer Yes / Partial / No)", expanded=True):
+        st.caption(
+            "Tip: 'Partial' must still be evidence-based (e.g., bias testing exists but missing segments, thresholds, or approvals)."
         )
-        if new_answer != default_answer:
-            st.session_state.user_checklist_answers[selected_model_name][question_id] = new_answer
-            answers_updated = True
-    
-    if answers_updated:
-        st.rerun()
+        for q in ETHICAL_CHECKLIST:
+            col1, col2 = st.columns([3, 2])
+            with col1:
+                st.markdown(
+                    f"**Q{q['id']} ({q['pillar']}, weight={q['weight']}):** {q['question']}")
+            with col2:
+                answers[q["id"]] = st.selectbox(
+                    "Answer",
+                    ["yes", "partial", "no"],
+                    index=2,
+                    key=f"ans_{selected_model}_{q['id']}",
+                    help=(
+                        "Yes = documented evidence + sign-off. "
+                        "Partial = evidence exists but incomplete coverage/thresholds/approvals. "
+                        "No = absent."
+                    ),
+                )
+            st.caption(
+                "Evidence expectation: a named artifact (report/memo/log/runbook), not verbal assurance.")
 
-    if st.button(f"Generate Evaluation Report for {selected_model_name}"):
-        # Call the apply_checklist function from source.py
-        answers_for_model = st.session_state.user_checklist_answers.get(selected_model_name, {})
-        raw_result = apply_checklist(selected_model_name, answers_for_model)
+    st.markdown("### Step 2: Compute results (traceable)")
 
-        # Recalculate pillar scores for the radar chart (display logic)
-        pillar_scores_for_display = calculate_pillar_scores_for_display(
-            selected_model_name, answers_for_model, st.session_state.ethical_checklist_questions
-        )
-        
-        # Update session state with results
-        st.session_state.ethical_evaluation_results[selected_model_name] = {
-            'score': raw_result['score'],
-            'grade': raw_result['grade'],
-            'gaps': raw_result['gaps'],
-            'pillar_scores': pillar_scores_for_display
-        }
-        st.success(f"Ethical evaluation for {selected_model_name} completed!")
-        st.rerun()
+    result = apply_ethical_checklist(selected_model, answers)
 
-    st.markdown("---")
-    st.subheader("Ethical Evaluation Results")
+    st.session_state.ethical_evaluation_results[selected_model] = {
+        "score_pct": float(result["score_percentage"]),
+        "raw_score": float(result["raw_score"]),
+        "max_score": float(result["max_possible_score"]),
+        "grade": result["grade"],
+        "gaps": int(result["gaps_count"]),
+        "gaps_details": result["gaps_details"],
+        "full": result["full_checklist_results"],
+        "tier": tier_value,
+    }
 
-    if selected_model_name in st.session_state.ethical_evaluation_results:
-        results = st.session_state.ethical_evaluation_results[selected_model_name]
-        st.metric(label="Overall Score", value=f"{results['score']:.1f}%", delta=f"Grade: {results['grade']}")
+    a, b, c, d = st.columns(4)
+    a.metric("Raw points", f"{result['raw_score']:.1f}")
+    b.metric("Max points", f"{result['max_possible_score']:.1f}")
+    c.metric("Ethical Score (%)", f"{result['score_percentage']:.1f}")
+    d.metric("Grade", result["grade"])
 
-        # Radar Chart for Pillar Scores
-        st.subheader("Pillar-wise Ethical Scores (Radar Chart)")
-        pillar_labels = list(results['pillar_scores'].keys())
-        pillar_values = list(results['pillar_scores'].values())
+    st.markdown("### Step 3: Guardrails (to prevent score misinterpretation)")
+    hard_stops = []
+    if tier_value == 1 and answers.get(2) != "yes":
+        hard_stops.append(
+            "Bias testing (Q2) is not 'yes' for a Tier 1 model → treat as deployment blocker pending remediation.")
 
-        if pillar_labels and pillar_values:
-            fig = go.Figure(data=go.Scatterpolar(
-                r=pillar_values + [pillar_values[0]], # Close the loop
-                theta=pillar_labels + [pillar_labels[0]], # Close the loop
-                fill='toself'
-            ))
-            fig.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=True, range=[0, 100])
-                ),
-                showlegend=False,
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No pillar scores available to display radar chart.")
-        
-        st.subheader("Identified Governance Gaps")
-        if results['gaps'] > 0:
-            st.warning(f"There are {results['gaps']} gaps to address for this model:")
-            gaps_found = []
-            current_answers_full = st.session_state.user_checklist_answers.get(selected_model_name, {})
-            for q_item in st.session_state.ethical_checklist_questions:
-                if current_answers_full.get(q_item['id'], 'no') != 'yes':
-                    gaps_found.append(f"Q{q_item['id']} ({q_item['pillar']}): {q_item['question']}")
-            
-            for gap in gaps_found:
-                st.markdown(f"- {gap}")
-        else:
-            st.success("No significant governance gaps identified for this model! Well done.")
+    if hard_stops:
+        st.error("Deployment guardrail triggered:\n" +
+                 "\n".join([f"- {x}" for x in hard_stops]))
+        recommendation = "BLOCKED pending remediation (guardrail triggered)"
     else:
-        st.info(f"No evaluation results yet for {selected_model_name}. Please answer the questions and click 'Generate Evaluation Report'.")
+        if tier_value == 1 and result["grade"] in ["A", "B"]:
+            recommendation = "Deployable with controls (committee sign-off + monitoring + evidence pack required)"
+        elif result["grade"] == "A":
+            recommendation = "Deployable (subject to standard monitoring + documentation)"
+        elif result["grade"] == "B":
+            recommendation = "Deployable with remediation plan and defined owners"
+        elif result["grade"] == "C":
+            recommendation = "Not production-ready without remediation"
+        else:
+            recommendation = "BLOCKED pending remediation"
 
-    st.markdown(f"""
-    **Explanation of Execution**
+    st.success(f"**Recommendation:** {recommendation}")
+    st.caption("Decision translation: the score is control coverage. A high score is necessary but not sufficient if a critical control is missing.")
 
-    The checklist results provide Alex with actionable insights:
-    *   The **Credit Default XGBoost** model, being relatively well-governed (achieving a "B" grade in our example), shows "PARTIAL" answers for Q6 (AI-generated content labeling) and Q8 (incident response plan), indicating minor areas for improvement. Alex would recommend clearer guidelines for labeling credit decision rationales and solidifying the incident response protocol for this model.
-    *   The **Trading RL Agent**, on the other hand, received an "F" grade with significant gaps in our example. This is a critical finding for Alex. The "FAIL" answers for Q2 (bias testing), Q3 (explainability), Q6 (labeling), Q8 (incident response), and Q9 (independent validation) highlight major deficiencies. This model is **not ready for production deployment** without substantial work. Alex would escalate these findings, recommending a dedicated team to address bias testing, improve model explainability, develop a robust incident response, and ensure independent validation. These gaps directly correspond to the pillars of Fairness, Transparency, Accountability, and Reliability.
+    st.subheader("Identified Governance Gaps (action plan)")
+    if result["gaps_count"] == 0:
+        st.success("No gaps identified (all controls marked 'yes').")
+    else:
+        st.dataframe(pd.DataFrame(result["gaps_details"]))
 
-    This process allows Alex to move beyond generic "AI risk" to specific, quantifiable ethical deficiencies and define clear action items for the model development teams.
-    """)
+    st.subheader("Pillar Diagnostic (do not treat as performance)")
+    pill = {}
+    for row in result["full_checklist_results"]:
+        p = row["pillar"]
+        pill.setdefault(p, {"earned": 0.0, "max": 0.0})
+        pill[p]["earned"] += float(row["points_earned"])
+        pill[p]["max"] += float(row["weight"])
 
+    pillars = list(pill.keys())
+    values = [(pill[p]["earned"] / pill[p]["max"] * 100.0)
+              if pill[p]["max"] else 0.0 for p in pillars]
+    pillars_plot = pillars + [pillars[0]] if pillars else []
+    values_plot = values + [values[0]] if values else []
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=values_plot, theta=pillars_plot,
+                  fill="toself", name="Control coverage by pillar (%)"))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        showlegend=False,
+        height=420,
+        margin=dict(l=40, r=40, t=40, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.warning(
+        "Guardrail: a symmetric radar does not imply deployability. One critical gap (e.g., bias testing in regulated contexts) "
+        "can dominate the decision regardless of the overall shape."
+    )
+
+    st.markdown("### Quick checkpoint (common misconception)")
+    q3 = st.radio(
+        "What does an ethical checklist score primarily represent?",
+        [
+            "Predictive accuracy and robustness.",
+            "Governance control coverage and evidence readiness.",
+            "Expected financial return.",
+        ],
+        index=None,
+        key="quiz_checklist_q1",
+    )
+    if q3:
+        if q3.startswith("Governance control coverage"):
+            st.success(
+                "Correct. This score measures control coverage and evidence readiness.")
+        else:
+            st.warning(
+                "Watch-out: this score is not a performance metric. It is a governance/evidence readiness measure.")
+
+# =============================================================================
+# Page: 4. Human Oversight Policy
+# =============================================================================
 elif st.session_state.current_page == "4. Human Oversight Policy":
-    st.header("4. Structuring Human Oversight for AI Decisions")
-    st.markdown(f"""
-    AI model decisions vary in their potential impact and need for human intervention. Alex needs to ensure that QuantAlpha has a clear **Human Oversight Policy** that defines appropriate levels of human involvement for different types of AI decisions. This policy prevents fully automated decisions in high-stakes scenarios while allowing AI to operate autonomously where human review is less critical, thereby optimizing efficiency without compromising safety or accountability. This also directly supports the "Accountability" and "Transparency" pillars of the governance framework.
+    st.header("Human Oversight Policy: Who Can Stop the Model, When, and How Fast")
 
-    QuantAlpha recognizes three levels of human oversight:
-    *   **Human-in-the-Loop:** Human approval is *required* before AI decisions are executed. Used for high-stakes, irreversible decisions.
-    *   **Human-on-the-Loop:** AI executes decisions, but humans *monitor* and can *intervene* if necessary. Used for automated processes within defined boundaries.
-    *   **Human-out-of-the-Loop:** AI operates autonomously; humans *periodically review* outputs or processes. Used for low-stakes, internal operations.
-    """)
+    st.markdown(
+        """
+Human oversight is a **control choice**: it defines who has authority to approve, override, or stop model-driven actions,
+and what escalation path exists when the model behaves unexpectedly.
 
-    st.subheader("QuantAlpha's Human Oversight Policy")
-    for level, policy in st.session_state.oversight_policy_data.items():
-        st.markdown(f"### {level.replace('_', ' ').upper()}:")
-        st.markdown(f"- **Description**: {policy['description']}")
-        st.markdown(f"- **Applies to**: {', '.join(policy['applies_to'])}")
-        st.markdown(f"- **Course Example**: _{policy['example']}_")
+This is analogous to trading controls (limits, approvals, kill-switches) and credit controls (manual review triggers).
+        """
+    )
 
-    st.markdown(f"""
-    **Explanation of Execution**
+    st.subheader("Oversight Levels (operational definitions)")
+    for level, desc in OVERSIGHT_POLICY.items():
+        with st.expander(level, expanded=False):
+            st.write(desc)
 
-    The human oversight policy clearly delineates when and how humans must interact with AI systems. For Alex, this is critical for designing appropriate controls for each model. For instance:
-    *   The **Credit Default XGBoost** model, given its `automated_decision` nature and high financial impact, would fall under "Human-in-the-Loop" for critical decisions exceeding a certain threshold (e.g., > $100K).
-    *   The **Trading RL Agent**, while `autonomous_action`, if constrained by `pre-set limits`, could be managed under "Human-on-the-Loop", allowing for real-time monitoring and intervention.
-    *   The **News Sentiment (FinBERT)** model, being `informational`, would likely be "Human-out-of-the-Loop", with periodic reviews of its general output quality.
+    assumptions_box(
+        [
+            "Oversight thresholds in this lab (e.g., $100k, $1M) are illustrative and should be calibrated to your risk appetite.",
+            "Oversight is not a substitute for fairness testing, transparency, or incident readiness.",
+            "Oversight must be consistent with Tier: Tier 1 models typically require stronger oversight or stricter guardrails.",
+        ],
+        title="Oversight assumptions & calibration",
+    )
 
-    This policy helps Alex ensure that QuantAlpha implements robust human checks where risk is highest, aligning with the "Accountability" pillar and managing operational risk effectively.
-    """)
+    st.markdown("### Quick checkpoint")
+    q4 = st.radio(
+        "A model can be 'human-on-the-loop' and still be unacceptable to deploy because:",
+        [
+            "Monitoring is slower than automation.",
+            "Oversight does not replace required evidence-based controls (e.g., bias tests, explainability artifacts).",
+            "Humans always catch errors.",
+        ],
+        index=None,
+        key="quiz_oversight_q1",
+    )
+    if q4:
+        if q4.startswith("Oversight does not replace"):
+            st.success(
+                "Correct. Oversight is one control; it does not replace missing evidence-based controls.")
+        else:
+            st.warning(
+                "Watch-out: oversight helps, but missing required controls can still block deployment.")
 
+# =============================================================================
+# Page: 5. Regulatory Mapping
+# =============================================================================
 elif st.session_state.current_page == "5. Regulatory Mapping":
-    st.header("5. Navigating the Regulatory Landscape: Compliance Mapping")
-    st.markdown(f"""
-    QuantAlpha operates in a heavily regulated industry. For Alex, it's not enough to define internal governance; he must also demonstrate **regulatory compliance**. This involves mapping external regulatory requirements (e.g., SR 11-7, EU AI Act, ECOA, FINRA) to the specific internal governance controls and tools that QuantAlpha has implemented. This exercise proves due diligence, identifies any compliance gaps, and provides a clear audit trail for regulators, reinforcing the "Regulatory Compliance" pillar.
-    """)
+    st.header("Regulatory Traceability: Requirement → Control → Evidence")
 
-    st.subheader("QuantAlpha's Regulatory Compliance Mapping")
-    for reg, details in st.session_state.regulatory_map_data.items():
-        st.markdown(f"### {reg}:")
-        for i, (req, ctrl) in enumerate(zip(details['requires'], details['our_controls'])):
-            st.markdown(f"- **Requirement**: {req}")
-            st.markdown(f"  **Our Control**: {ctrl}")
-        st.markdown("---")
+    st.markdown(
+        """
+This page is a **traceability matrix**. In an audit conversation, you need to answer:
+- Which requirement applies?
+- Which internal control satisfies it?
+- What evidence artifact proves it was executed?
 
-    st.markdown(f"""
-    **Explanation of Execution**
+The goal is not to memorize regulations; it is to produce defensible mappings.
+        """
+    )
 
-    This mapping demonstrates to Alex (and external auditors) how QuantAlpha's internal governance mechanisms directly address specific regulatory mandates. For example:
-    *   The requirement for 'Independent validation' under **SR 11-7** is met by QuantAlpha's 'D4-T1-C2 validation' control.
-    *   The **EU AI Act's** 'Bias testing' requirement is addressed by 'D4-T2 fairness testing'.
-    *   **ECOA's** 'No discrimination' requirement is covered by 'D4-T2-C1 fairness metrics' and 'D4-T2-C2 bias mitigation'.
+    st.subheader("Legend (to reduce cognitive load)")
+    st.info(
+        "Control codes (e.g., D4-T1-C2) are internal identifiers that should map to lifecycle stage and control category. "
+        "In a mature program, each control must have an evidence artifact (report/log/sign-off)."
+    )
 
-    This systematic approach ensures that Alex can confidently affirm QuantAlpha's commitment to compliance, minimizing legal and reputational risks associated with AI deployment. Any requirement without a corresponding control would immediately signal a critical compliance gap for Alex to address.
-    """)
-
-elif st.session_state.current_page == "6. Governance Policy Document":
-    st.header("6. Formalizing Governance: Generating the AI Governance Policy Document")
-    st.markdown(f"""
-    After assessing individual models, defining oversight, and mapping regulations, Alex's final task is to compile all these elements into a formal **AI Governance Policy Document**. This document is crucial for QuantAlpha's AI Governance Committee. It serves as an official reference, standardizing practices across the firm, communicating policies to all stakeholders, and acting as a living document that can be updated as AI technology and regulations evolve. For Alex, generating this document solidifies all his previous analysis into a coherent, actionable policy framework.
-    """)
-
-    policy = st.session_state.governance_policy_document_content
-    st.subheader(policy['title'])
-    st.markdown(f"**Version**: {policy['version']}")
-    st.markdown(f"**Effective Date**: {policy['effective_date']}")
-    st.markdown(f"**Approved By**: {policy['approved_by']}")
-    st.markdown("---")
-
-    for section_key, content in policy['sections'].items():
-        st.markdown(f"### {section_key.upper().replace('_',' ')}")
-        st.markdown(f" {content}")
-        st.markdown("")
-
-    st.markdown("---")
-    st.subheader("SIGN-OFFS:")
-    for sign_off_line in policy['sign_off']:
-        st.markdown(f"- {sign_off_line}")
-
-    st.markdown(f"""
-    **Explanation of Execution**
-
-    The generated output is a structured policy document ready for review and adoption by QuantAlpha's AI Governance Committee. This document summarizes all key aspects of AI governance, from foundational principles to operational controls and regulatory mappings. For Alex, this is the ultimate deliverable, demonstrating how a systematic approach to AI governance allows the firm to deploy AI responsibly, manage risk proactively, and maintain trust with clients and regulators. It formalizes QuantAlpha's commitment to ethical AI and provides a clear roadmap for all AI initiatives.
-    """)
-
-elif st.session_state.current_page == "7. Final Report":
-    st.header("7. Conclusion: Actionable Insights and Future Steps")
-    st.markdown(f"""
-    Through this detailed workflow, Alex Chen has successfully applied QuantAlpha's AI Governance Framework. He has:
-    *   Categorized AI models by their risk tiers, enabling proportional governance.
-    *   Identified specific ethical gaps in high-risk models, particularly the Trading RL Agent, necessitating immediate remediation efforts.
-    *   Clarified human oversight requirements for various AI-driven decisions.
-    *   Mapped QuantAlpha's controls to relevant financial regulations, ensuring compliance.
-    *   Compiled a formal AI Governance Policy Document to guide future AI deployments.
-
-    The "Ethical AI Evaluation Report" derived from this process (summarized below) provides QuantAlpha's AI Governance Committee with concrete data, identified gaps, and clear recommendations. For the Trading RL Agent, Alex will recommend a project to implement bias testing, improve explainability, and develop a comprehensive incident response plan, aligning it with Tier 1 governance requirements before it can proceed to full production.
-
-    This hands-on exercise underscores that responsible AI is an ongoing process of assessment, adaptation, and continuous improvement. By integrating these governance practices into their daily operations, CFA Charterholders and Investment Professionals like Alex ensure that AI innovations not only drive financial performance but also uphold ethical standards and regulatory compliance.
-    """)
-
-    st.subheader("Summary of Model Risk Tiers")
-    st.dataframe(st.session_state.tier_df_data[['model', 'score', 'tier', 'governance_requirements']].style.set_properties(**{'font-size': '12pt'}))
-
-    st.subheader("Summary of Ethical Evaluation Results")
-    if st.session_state.ethical_evaluation_results:
-        summary_data = []
-        for model_name, results in st.session_state.ethical_evaluation_results.items():
-            summary_data.append({
-                'Model': model_name,
-                'Ethical Score (%)': f"{results['score']:.1f}",
-                'Grade': results['grade'],
-                'Gaps Identified': results['gaps']
+    rows = []
+    for reg_name, details in REGULATORY_MAP.items():
+        # Each regulation has multiple requirements and controls
+        for req, ctrl in zip(details['requires'], details['our_controls']):
+            rows.append({
+                "Regulation / Standard": reg_name,
+                "Requirement": req,
+                "Our Control": ctrl,
+                "Evidence example (what you should show)": "Validation memo / test report / audit log / runbook",
             })
-        st.dataframe(pd.DataFrame(summary_data).set_index('Model'))
+    st.dataframe(pd.DataFrame(rows))
 
-        st.markdown("---")
-        st.subheader("Detailed Ethical Gaps for Models with Deficiencies")
-        for model_name, results in st.session_state.ethical_evaluation_results.items():
-            if results['gaps'] > 0:
-                with st.expander(f"Gaps for {model_name} (Grade: {results['grade']})"):
-                    current_answers_full = st.session_state.user_checklist_answers.get(model_name, {})
-                    gaps_found = []
-                    for q_item in st.session_state.ethical_checklist_questions:
-                        if current_answers_full.get(q_item['id'], 'no') != 'yes':
-                            gaps_found.append(f"Q{q_item['id']} ({q_item['pillar']}): {q_item['question']}")
-                    for gap in gaps_found:
-                        st.markdown(f"- {gap}")
+    st.markdown("### Decision translation")
+    st.caption(
+        "If a requirement has no mapped control + evidence artifact, treat it like a compliance gap—"
+        "not an optional model improvement suggestion."
+    )
+
+# =============================================================================
+# Page: 6. Governance Policy Document
+# =============================================================================
+elif st.session_state.current_page == "6. Governance Policy Document":
+    st.header("Governance Policy Artifact: What the Committee Signs")
+
+    st.markdown(
+        """
+A policy document is how governance becomes institutional:
+- roles and responsibilities
+- lifecycle gates
+- tier-based control requirements
+- monitoring + incident response
+- evidence expectations for audits
+
+This page produces a **committee-facing artifact**—but remember: strong statements must be backed by operational capability.
+        """
+    )
+
+    st.subheader("Policy Document (sample template)")
+    st.markdown(
+        """
+**QuantAlpha AI Governance Policy (Sample)**  
+**Version:** 1.0  
+**Effective Date:** 2026-02-18  
+**Approved By:** AI Governance Committee  
+
+**Purpose:** Ensure responsible, auditable, and regulator-aligned deployment of AI models in financial decision-making.  
+
+**Scope:** All AI/ML systems used in client-facing decisions, trading, credit, research, and internal risk tooling.  
+
+**Principles (FATPSR):** Fairness, Accountability, Transparency, Privacy, Security, Reliability.  
+
+**Tiering:** Models are classified into Tier 1–3 based on documented risk factors. Tier determines minimum control requirements.  
+
+**Validation & Monitoring:** Tier 1 requires independent validation, bias testing, explainability artifacts, monitoring, and annual review.  
+Tier 2 requires validation, monitoring, manager approval, and biennial review.  
+Tier 3 requires documentation, basic testing, self-certification, and triennial review.  
+
+**Human Oversight:** Oversight level is selected based on tier and decision criticality, with escalation paths and intervention authority defined.  
+
+**Regulatory Mapping:** Applicable standards (e.g., SR 11-7, ECOA) must map to controls and evidence artifacts.  
+
+**Incident Response:** Trigger thresholds, escalation SLAs, and kill-switch procedures must be documented and tested.  
+        """
+    )
+
+    assumptions_box(
+        [
+            "This is a sample template; thresholds and obligations must be calibrated to your institution and jurisdiction.",
+            "Any quantitative compliance statement (e.g., fairness thresholds) must have a defined test method + evidence artifact.",
+        ],
+        title="Assumptions & guardrails for policy credibility",
+    )
+
+# =============================================================================
+# Page: 7. Final Report
+# =============================================================================
+elif st.session_state.current_page == "7. Final Report":
+    st.header("Final Report: Committee Decision Packet (Tier + Ethics + Actions)")
+
+    if not st.session_state.ethical_evaluation_results:
+        st.warning(
+            "No checklist evaluations have been completed yet. Go to **3. Ethical Checklist** and evaluate at least one model.")
     else:
-        st.info("No ethical evaluation results available yet. Please complete the 'Ethical Checklist' page.")
+        # --- Executive Summary ---
+        st.subheader("Executive Summary")
+        
+        total_models = len(st.session_state.ethical_evaluation_results)
+        tier1_models = sum(1 for r in st.session_state.ethical_evaluation_results.values() if r.get("tier") == 1)
+        tier2_models = sum(1 for r in st.session_state.ethical_evaluation_results.values() if r.get("tier") == 2)
+        tier3_models = sum(1 for r in st.session_state.ethical_evaluation_results.values() if r.get("tier") == 3)
+        
+        avg_score = sum(r["score_pct"] for r in st.session_state.ethical_evaluation_results.values()) / total_models
+        total_gaps = sum(r["gaps"] for r in st.session_state.ethical_evaluation_results.values())
+        
+        grade_counts = {}
+        for r in st.session_state.ethical_evaluation_results.values():
+            grade_counts[r["grade"]] = grade_counts.get(r["grade"], 0) + 1
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Models Evaluated", total_models)
+        col2.metric("Average Ethical Score", f"{avg_score:.1f}%")
+        col3.metric("Total Gaps Identified", total_gaps)
+        col4.metric("Tier 1 Models", tier1_models)
+        
+        if avg_score >= 80:
+            st.success(f"**Overall Assessment:** Portfolio demonstrates strong governance readiness with an average score of {avg_score:.1f}%.")
+        elif avg_score >= 60:
+            st.warning(f"**Overall Assessment:** Portfolio shows moderate governance readiness ({avg_score:.1f}%). Remediation required before deployment.")
+        else:
+            st.error(f"**Overall Assessment:** Portfolio has significant governance gaps ({avg_score:.1f}%). Substantial remediation needed.")
+        
+        st.divider()
+        
+        # --- Portfolio Summary Table ---
+        st.subheader("Portfolio Summary (governance readiness, not performance)")
 
-    st.subheader("Key Takeaways for QuantAlpha Investments")
-    st.markdown("""
-    *   **Proportional Governance**: The tiering system efficiently directs resources. Tier 1 models like 'Credit Default XGBoost' and 'Trading RL Agent' require the highest scrutiny.
-    *   **Urgent Remediation for Trading RL Agent**: Significant gaps in bias testing, explainability, and independent validation mean this model is **not ready for production**. A dedicated project for remediation is critical.
-    *   **Clear Oversight**: The Human Oversight Policy provides clear guidelines for human interaction with AI, balancing automation with accountability.
-    *   **Regulatory Readiness**: The compliance mapping confirms that QuantAlpha's controls align with key financial regulations, minimizing legal and reputational risks.
-    *   **Formalized Policy**: The AI Governance Policy Document serves as the official blueprint for all AI initiatives, ensuring consistent and responsible practices across the firm.
-    """)
+        summary_rows = []
+        for model_name, r in st.session_state.ethical_evaluation_results.items():
+            summary_rows.append({
+                "Model": model_name,
+                "Tier": r.get("tier", None),
+                "Ethical Score (%)": round(r["score_pct"], 1),
+                "Raw / Max": f"{r['raw_score']:.1f} / {r['max_score']:.1f}",
+                "Grade": r["grade"],
+                "Gaps (#)": r["gaps"],
+            })
+        summary_df = pd.DataFrame(summary_rows).set_index("Model")
+        st.dataframe(summary_df, use_container_width=True)
+
+        st.markdown("### Decision translation (how to use this table)")
+        st.caption(
+            "Use Tier to allocate governance burden; use checklist grade + gap severity to decide deploy / deploy-with-controls / block. "
+            "Scores are comparable only as control coverage—not as economic value or model skill."
+        )
+        
+        st.divider()
+        
+        # --- Tier Distribution Visualization ---
+        st.subheader("Portfolio Tier Distribution")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            tier_data = {"Tier 1": tier1_models, "Tier 2": tier2_models, "Tier 3": tier3_models}
+            fig_tier = go.Figure(data=[go.Pie(
+                labels=list(tier_data.keys()),
+                values=list(tier_data.values()),
+                hole=0.4,
+                marker_colors=['#FF6B6B', '#FFA07A', '#98D8C8']
+            )])
+            fig_tier.update_layout(
+                title="Models by Risk Tier",
+                height=300,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig_tier, use_container_width=True)
+            
+        with col2:
+            grade_data = {g: grade_counts.get(g, 0) for g in ['A', 'B', 'C', 'F']}
+            fig_grade = go.Figure(data=[go.Bar(
+                x=list(grade_data.keys()),
+                y=list(grade_data.values()),
+                marker_color=['#4CAF50', '#8BC34A', '#FFC107', '#F44336']
+            )])
+            fig_grade.update_layout(
+                title="Models by Ethical Grade",
+                xaxis_title="Grade",
+                yaxis_title="Count",
+                height=300,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig_grade, use_container_width=True)
+        
+        st.divider()
+        
+        # --- Individual Model Recommendations ---
+        st.subheader("Individual Model Recommendations")
+        
+        for model_name, r in st.session_state.ethical_evaluation_results.items():
+            with st.expander(f"📋 {model_name} — Tier {r.get('tier', 'N/A')} | Grade {r['grade']} | {r['score_pct']:.1f}%", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Tier", r.get("tier", "N/A"))
+                col2.metric("Grade", r["grade"])
+                col3.metric("Gaps", r["gaps"])
+                
+                # Determine recommendation
+                tier_val = r.get("tier")
+                grade = r["grade"]
+                
+                if tier_val == 1 and grade in ["A", "B"]:
+                    rec = "✅ **Deployable with controls** (committee sign-off + monitoring + evidence pack required)"
+                    rec_color = "success"
+                elif tier_val == 1 and r["gaps"] > 0:
+                    rec = "🚫 **BLOCKED** pending remediation (Tier 1 with gaps)"
+                    rec_color = "error"
+                elif grade == "A":
+                    rec = "✅ **Deployable** (subject to standard monitoring + documentation)"
+                    rec_color = "success"
+                elif grade == "B":
+                    rec = "⚠️ **Deployable with remediation plan** and defined owners"
+                    rec_color = "warning"
+                elif grade == "C":
+                    rec = "⚠️ **Not production-ready** without remediation"
+                    rec_color = "warning"
+                else:
+                    rec = "🚫 **BLOCKED** pending remediation"
+                    rec_color = "error"
+                
+                if rec_color == "success":
+                    st.success(rec)
+                elif rec_color == "warning":
+                    st.warning(rec)
+                else:
+                    st.error(rec)
+                
+                if r["gaps"] > 0:
+                    st.markdown("**Identified Gaps:**")
+                    st.dataframe(pd.DataFrame(r["gaps_details"]), use_container_width=True)
+                else:
+                    st.info("✅ No gaps identified — all controls marked 'yes'")
+        
+        st.divider()
+        
+        # --- Action Plan Summary ---
+        st.subheader("Consolidated Action Plan")
+        
+        all_gaps_by_pillar = {}
+        for model_name, r in st.session_state.ethical_evaluation_results.items():
+            for gap in r["gaps_details"]:
+                pillar = gap["pillar"]
+                if pillar not in all_gaps_by_pillar:
+                    all_gaps_by_pillar[pillar] = []
+                all_gaps_by_pillar[pillar].append({
+                    "Model": model_name,
+                    "Question ID": gap["id"],
+                    "Question": gap["question"]
+                })
+        
+        if total_gaps > 0:
+            st.warning(f"**Total gaps across portfolio:** {total_gaps}")
+            for pillar, gaps in sorted(all_gaps_by_pillar.items()):
+                with st.expander(f"{pillar} — {len(gaps)} gap(s)", expanded=False):
+                    st.dataframe(pd.DataFrame(gaps), use_container_width=True)
+                    st.caption(
+                        f"**Recommended action:** Assign owner, define evidence artifact, set remediation ETA for each {pillar} gap."
+                    )
+        else:
+            st.success("✅ No gaps identified across the portfolio. All models have complete control coverage.")
+        
+        st.divider()
+        
+        # --- Guardrails ---
+        st.subheader("Guardrails (prevent misinterpretation)")
+        st.warning(
+            "1) Ethical score is control coverage, not predictive accuracy.\n"
+            "2) A single critical gap can block deployment even with a high score.\n"
+            "3) Tier drives required controls; it does not prove the model is acceptable.\n"
+            "4) This report is a governance readiness assessment, not a business case or performance evaluation."
+        )
+        
+        st.divider()
+        
+        # --- Next Steps ---
+        st.subheader("Recommended Next Steps")
+        st.markdown("""
+        1. **Committee Review:** Present this report to the AI Governance Committee for formal review and sign-off
+        2. **Gap Remediation:** Assign owners and deadlines for each identified gap
+        3. **Evidence Collection:** Ensure all required artifacts (test reports, audit logs, runbooks) are documented and accessible
+        4. **Deployment Planning:** For approved models, define monitoring thresholds, escalation procedures, and review cycles
+        5. **Regulatory Alignment:** Validate that all Tier 1 models have complete regulatory mapping and evidence trails
+        6. **Ongoing Monitoring:** Establish periodic review cadence (annual for Tier 1, biennial for Tier 2, triennial for Tier 3)
+        """)
+        
+        st.info("💡 **Export Recommendation:** Download this report as PDF for committee records and audit documentation.")
 
 
 # License
